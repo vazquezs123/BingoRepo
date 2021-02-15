@@ -1,622 +1,168 @@
-.PHONY: build package run stop run-client run-server run-haserver stop-client stop-server restart restart-server restart-client restart-haserver start-docker clean-dist clean nuke check-style check-client-style check-server-style check-unit-tests test dist prepare-enteprise run-client-tests setup-run-client-tests cleanup-run-client-tests test-client build-linux build-osx build-windows internal-test-web-client vet run-server-for-web-client-tests diff-config prepackaged-plugins prepackaged-binaries test-server test-server-ee test-server-quick test-server-race start-docker-check
+.PHONY: build test run clean stop check-style fix-style run-unit emojis help package-ci storybook build-storybook update-dependencies
 
-ROOT := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+BUILD_SERVER_DIR = ../mattermost-server
+BUILD_WEBAPP_DIR = ../mattermost-webapp
+MM_UTILITIES_DIR = ../mattermost-utilities
+EMOJI_TOOLS_DIR = ./build/emoji
+export NODE_OPTIONS=--max-old-space-size=4096
 
-ifeq ($(OS),Windows_NT)
-	PLATFORM := Windows
-else
-	PLATFORM := $(shell uname)
-endif
+build-storybook: node_modules ## Build the storybook
+	@echo Building storybook
 
-# Set an environment variable on Linux used to resolve `docker.host.internal` inconsistencies with
-# docker. This can be reworked once https://github.com/docker/for-linux/issues/264 is resolved
-# satisfactorily.
-ifeq ($(PLATFORM),Linux)
-	export IS_LINUX = -linux
-else
-	export IS_LINUX =
-endif
+	npm run build-storybook
 
-IS_CI ?= false
-# Build Flags
-BUILD_NUMBER ?= $(BUILD_NUMBER:)
-BUILD_DATE = $(shell date -u)
-BUILD_HASH = $(shell git rev-parse HEAD)
-# If we don't set the build number it defaults to dev
-ifeq ($(BUILD_NUMBER),)
-	BUILD_NUMBER := dev
-endif
-BUILD_ENTERPRISE_DIR ?= ../enterprise
-BUILD_ENTERPRISE ?= true
-BUILD_ENTERPRISE_READY = false
-BUILD_TYPE_NAME = team
-BUILD_HASH_ENTERPRISE = none
-ifneq ($(wildcard $(BUILD_ENTERPRISE_DIR)/.),)
-	ifeq ($(BUILD_ENTERPRISE),true)
-		BUILD_ENTERPRISE_READY = true
-		BUILD_TYPE_NAME = enterprise
-		BUILD_HASH_ENTERPRISE = $(shell cd $(BUILD_ENTERPRISE_DIR) && git rev-parse HEAD)
-	else
-		BUILD_ENTERPRISE_READY = false
-		BUILD_TYPE_NAME = team
-	endif
-else
-	BUILD_ENTERPRISE_READY = false
-	BUILD_TYPE_NAME = team
-endif
-BUILD_WEBAPP_DIR ?= ../mattermost-webapp
-BUILD_CLIENT = false
-BUILD_HASH_CLIENT = independant
-ifneq ($(wildcard $(BUILD_WEBAPP_DIR)/.),)
-	ifeq ($(BUILD_CLIENT),true)
-		BUILD_CLIENT = true
-		BUILD_HASH_CLIENT = $(shell cd $(BUILD_WEBAPP_DIR) && git rev-parse HEAD)
-	else
-		BUILD_CLIENT = false
-	endif
-else
-	BUILD_CLIENT = false
-endif
+storybook: node_modules ## Run the storybook development environment
+	npm run storybook
 
-# Go Flags
-GOFLAGS ?= $(GOFLAGS:)
-# We need to export GOBIN to allow it to be set
-# for processes spawned from the Makefile
-export GOBIN ?= $(PWD)/bin
-GO=go
-DELVE=dlv
-LDFLAGS += -X "github.com/mattermost/mattermost-server/v5/model.BuildNumber=$(BUILD_NUMBER)"
-LDFLAGS += -X "github.com/mattermost/mattermost-server/v5/model.BuildDate=$(BUILD_DATE)"
-LDFLAGS += -X "github.com/mattermost/mattermost-server/v5/model.BuildHash=$(BUILD_HASH)"
-LDFLAGS += -X "github.com/mattermost/mattermost-server/v5/model.BuildHashEnterprise=$(BUILD_HASH_ENTERPRISE)"
-LDFLAGS += -X "github.com/mattermost/mattermost-server/v5/model.BuildEnterpriseReady=$(BUILD_ENTERPRISE_READY)"
+check-style: node_modules ## Checks JS file for ESLint confirmity
+	@echo Checking for style guide compliance
 
-GO_MAJOR_VERSION = $(shell $(GO) version | cut -c 14- | cut -d' ' -f1 | cut -d'.' -f1)
-GO_MINOR_VERSION = $(shell $(GO) version | cut -c 14- | cut -d' ' -f1 | cut -d'.' -f2)
-MINIMUM_SUPPORTED_GO_MAJOR_VERSION = 1
-MINIMUM_SUPPORTED_GO_MINOR_VERSION = 15
-GO_VERSION_VALIDATION_ERR_MSG = Golang version is not supported, please update to at least $(MINIMUM_SUPPORTED_GO_MAJOR_VERSION).$(MINIMUM_SUPPORTED_GO_MINOR_VERSION)
+	npm run check
 
-# GOOS/GOARCH of the build host, used to determine whether we're cross-compiling or not
-BUILDER_GOOS_GOARCH="$(shell $(GO) env GOOS)_$(shell $(GO) env GOARCH)"
+fix-style: node_modules ## Fix JS file ESLint issues
+	@echo Fixing lint issues to follow style guide
 
-PLATFORM_FILES="./cmd/mattermost/main.go"
+	npm run fix
 
-# Output paths
-DIST_ROOT=dist
-DIST_PATH=$(DIST_ROOT)/mattermost
+check-types: node_modules ## Checks TS file for TypeScript confirmity
+	@echo Checking for TypeScript compliance
 
-# Tests
-TESTS=.
+	npm run check-types
 
-# Packages lists
-TE_PACKAGES=$(shell $(GO) list ./... | grep -v ./data)
+test: node_modules ## Runs tests
+	@echo Running jest unit/component testing
 
-# Plugins Packages
-PLUGIN_PACKAGES ?= mattermost-plugin-antivirus-v0.1.2
-PLUGIN_PACKAGES += mattermost-plugin-autolink-v1.2.1
-PLUGIN_PACKAGES += mattermost-plugin-aws-SNS-v1.2.0
-PLUGIN_PACKAGES += mattermost-plugin-channel-export-v0.2.2
-PLUGIN_PACKAGES += mattermost-plugin-custom-attributes-v1.3.0
-PLUGIN_PACKAGES += mattermost-plugin-github-v2.0.0
-PLUGIN_PACKAGES += mattermost-plugin-gitlab-v1.3.0
-PLUGIN_PACKAGES += mattermost-plugin-incident-collaboration-v1.3.2
-PLUGIN_PACKAGES += mattermost-plugin-jenkins-v1.1.0
-PLUGIN_PACKAGES += mattermost-plugin-jira-v2.4.0
-PLUGIN_PACKAGES += mattermost-plugin-nps-v1.1.0
-PLUGIN_PACKAGES += mattermost-plugin-welcomebot-v1.2.0
-PLUGIN_PACKAGES += mattermost-plugin-zoom-v1.5.0
-
-# Prepares the enterprise build if exists. The IGNORE stuff is a hack to get the Makefile to execute the commands outside a target
-ifeq ($(BUILD_ENTERPRISE_READY),true)
-	IGNORE:=$(shell echo Enterprise build selected, preparing)
-	IGNORE:=$(shell rm -f imports/imports.go)
-	IGNORE:=$(shell cp $(BUILD_ENTERPRISE_DIR)/imports/imports.go imports/)
-	IGNORE:=$(shell rm -f enterprise)
-	IGNORE:=$(shell ln -s $(BUILD_ENTERPRISE_DIR) enterprise)
-else
-	IGNORE:=$(shell rm -f imports/imports.go)
-endif
-
-EE_PACKAGES=$(shell $(GO) list ./enterprise/...)
-
-ifeq ($(BUILD_ENTERPRISE_READY),true)
-ALL_PACKAGES=$(TE_PACKAGES) $(EE_PACKAGES)
-else
-ALL_PACKAGES=$(TE_PACKAGES)
-endif
-
-all: run ## Alias for 'run'.
-
--include config.override.mk
-include config.mk
-include build/*.mk
-
-RUN_IN_BACKGROUND ?=
-ifeq ($(RUN_SERVER_IN_BACKGROUND),true)
-	RUN_IN_BACKGROUND := &
-endif
-
-start-docker-check:
-ifeq (,$(findstring minio,$(ENABLED_DOCKER_SERVICES)))
-  TEMP_DOCKER_SERVICES:=$(TEMP_DOCKER_SERVICES) minio
-endif
-ifeq ($(BUILD_ENTERPRISE_READY),true)
-  ifeq (,$(findstring openldap,$(ENABLED_DOCKER_SERVICES)))
-    TEMP_DOCKER_SERVICES:=$(TEMP_DOCKER_SERVICES) openldap
-  endif
-  ifeq (,$(findstring elasticsearch,$(ENABLED_DOCKER_SERVICES)))
-    TEMP_DOCKER_SERVICES:=$(TEMP_DOCKER_SERVICES) elasticsearch
-  endif
-endif
-ENABLED_DOCKER_SERVICES:=$(ENABLED_DOCKER_SERVICES) $(TEMP_DOCKER_SERVICES)
-
-start-docker: ## Starts the docker containers for local development.
-ifneq ($(IS_CI),false)
-	@echo CI Build: skipping docker start
-else ifeq ($(MM_NO_DOCKER),true)
-	@echo No Docker Enabled: skipping docker start
-else
-	@echo Starting docker containers
-
-	$(GO) run ./build/docker-compose-generator/main.go $(ENABLED_DOCKER_SERVICES) | docker-compose -f docker-compose.makefile.yml -f /dev/stdin run --rm start_dependencies
-ifneq (,$(findstring openldap,$(ENABLED_DOCKER_SERVICES)))
-	cat tests/${LDAP_DATA}-data.ldif | docker-compose -f docker-compose.makefile.yml exec -T openldap bash -c 'ldapadd -x -D "cn=admin,dc=mm,dc=test,dc=com" -w mostest || true';
-endif
-endif
-
-run-haserver: run-client
-ifeq ($(BUILD_ENTERPRISE_READY),true)
-	@echo Starting mattermost in an HA topology
-
-	docker-compose -f docker-compose.yaml up haproxy
-endif
-
-stop-docker: ## Stops the docker containers for local development.
-ifeq ($(MM_NO_DOCKER),true)
-	@echo No Docker Enabled: skipping docker stop
-else
-	@echo Stopping docker containers
-
-	docker-compose stop
-endif
-
-clean-docker: ## Deletes the docker containers for local development.
-ifeq ($(MM_NO_DOCKER),true)
-	@echo No Docker Enabled: skipping docker clean
-else
-	@echo Removing docker containers
-
-	docker-compose down -v
-	docker-compose rm -v
-endif
-
-
-plugin-checker:
-	$(GO) run $(GOFLAGS) ./plugin/checker
-
-prepackaged-plugins: ## Populate the prepackaged-plugins directory
-	@echo Downloading prepackaged plugins
-	mkdir -p prepackaged_plugins
-	@cd prepackaged_plugins && for plugin_package in $(PLUGIN_PACKAGES) ; do \
-		curl -f -O -L https://plugins-store.test.mattermost.com/release/$$plugin_package.tar.gz; \
-		curl -f -O -L https://plugins-store.test.mattermost.com/release/$$plugin_package.tar.gz.sig; \
-	done
-
-prepackaged-binaries: ## Populate the prepackaged-binaries to the bin directory
-ifeq ($(shell test -f bin/mmctl && printf "yes"),yes)
-	@echo "MMCTL already exists in bin/mmctl not downloading a new version."
-else
-	@scripts/download_mmctl_release.sh
-endif
-
-golangci-lint: ## Run golangci-lint on codebase
-# https://stackoverflow.com/a/677212/1027058 (check if a command exists or not)
-	@if ! [ -x "$$(command -v golangci-lint)" ]; then \
-		echo "golangci-lint is not installed. Please see https://github.com/golangci/golangci-lint#install for installation instructions."; \
-		exit 1; \
-	fi; \
-
-	@echo Running golangci-lint
-	golangci-lint run ./...
-ifeq ($(BUILD_ENTERPRISE_READY),true)
-ifneq ($(MM_NO_ENTERPRISE_LINT),true)
-	golangci-lint run ./enterprise/...
-endif
-endif
-
-app-layers: ## Extract interface from App struct
-	$(GO) get -modfile=go.tools.mod github.com/reflog/struct2interface
-	$(GOBIN)/struct2interface -f "app" -o "app/app_iface.go" -p "app" -s "App" -i "AppIface" -t ./app/layer_generators/app_iface.go.tmpl
-	$(GO) run ./app/layer_generators -in ./app/app_iface.go -out ./app/opentracing/opentracing_layer.go -template ./app/layer_generators/opentracing_layer.go.tmpl
+	npm run test
 
 i18n-extract: ## Extract strings for translation from the source code
-	$(GO) get -modfile=go.tools.mod github.com/mattermost/mattermost-utilities/mmgotool
-	$(GOBIN)/mmgotool i18n extract --portal-dir=""
+	npm run mmjstool -- i18n extract-webapp
 
-i18n-check: ## Exit on empty translation strings and translation source strings
-	$(GO) get -modfile=go.tools.mod github.com/mattermost/mattermost-utilities/mmgotool
-	$(GOBIN)/mmgotool i18n clean-empty --portal-dir="" --check
-	$(GOBIN)/mmgotool i18n check-empty-src --portal-dir=""
+node_modules: package.json package-lock.json
+	@echo Getting dependencies using npm
 
-store-mocks: ## Creates mock files.
-	$(GO) get -modfile=go.tools.mod github.com/vektra/mockery/...
-	$(GOBIN)/mockery -dir store -all -output store/storetest/mocks -note 'Regenerate this file using `make store-mocks`.'
+	npm install
+	touch $@
 
-telemetry-mocks: ## Creates mock files.
-	$(GO) get -modfile=go.tools.mod github.com/vektra/mockery/...
-	$(GOBIN)/mockery -dir services/telemetry -all -output services/telemetry/mocks -note 'Regenerate this file using `make telemetry-mocks`.'
+package: build ## Packages app
+	@echo Packaging webapp
 
-store-layers: ## Generate layers for the store
-	$(GO) generate $(GOFLAGS) ./store
+	mkdir tmp
+	mv dist tmp/client
+	tar -C tmp -czf mattermost-webapp.tar.gz client
+	mv tmp/client dist
+	rmdir tmp
 
-filesstore-mocks: ## Creates mock files.
-	$(GO) get -modfile=go.tools.mod github.com/vektra/mockery/...
-	$(GOBIN)/mockery -dir services/filesstore -all -output services/filesstore/mocks -note 'Regenerate this file using `make filesstore-mocks`.'
+package-ci: ## used in the CI to build the package and bypass the npm install
+	@echo Building mattermost Webapp
 
-ldap-mocks: ## Creates mock files for ldap.
-	$(GO) get -modfile=go.tools.mod github.com/vektra/mockery/...
-	$(GOBIN)/mockery -dir enterprise/ldap -all -output enterprise/ldap/mocks -note 'Regenerate this file using `make ldap-mocks`.'
+	rm -rf dist
+	npm run build
 
-plugin-mocks: ## Creates mock files for plugins.
-	$(GO) get -modfile=go.tools.mod github.com/vektra/mockery/...
-	$(GOBIN)/mockery -dir plugin -name API -output plugin/plugintest -outpkg plugintest -case underscore -note 'Regenerate this file using `make plugin-mocks`.'
-	$(GOBIN)/mockery -dir plugin -name Hooks -output plugin/plugintest -outpkg plugintest -case underscore -note 'Regenerate this file using `make plugin-mocks`.'
-	$(GOBIN)/mockery -dir plugin -name Helpers -output plugin/plugintest -outpkg plugintest -case underscore -note 'Regenerate this file using `make plugin-mocks`.'
+	@echo Packaging webapp
 
-einterfaces-mocks: ## Creates mock files for einterfaces.
-	$(GO) get -modfile=go.tools.mod github.com/vektra/mockery/...
-	$(GOBIN)/mockery -dir einterfaces -all -output einterfaces/mocks -note 'Regenerate this file using `make einterfaces-mocks`.'
+	mkdir tmp
+	mv dist tmp/client
+	tar -C tmp -czf mattermost-webapp.tar.gz client
+	mv tmp/client dist
+	rmdir tmp
 
-searchengine-mocks: ## Creates mock files for searchengines.
-	$(GO) get -modfile=go.tools.mod github.com/vektra/mockery/...
-	$(GOBIN)/mockery -dir services/searchengine -all -output services/searchengine/mocks -note 'Regenerate this file using `make searchengine-mocks`.'
+build: node_modules ## Builds the app
+	@echo Building mattermost Webapp
 
-pluginapi: ## Generates api and hooks glue code for plugins
-	$(GO) generate $(GOFLAGS) ./plugin
+	rm -rf dist
 
-check-prereqs: ## Checks prerequisite software status.
-	./scripts/prereq-check.sh
+	npm run build
 
-check-prereqs-enterprise: ## Checks prerequisite software status for enterprise.
-ifeq ($(BUILD_ENTERPRISE_READY),true)
-	./scripts/prereq-check-enterprise.sh
-endif
+run: node_modules ## Runs app
+	@echo Running mattermost Webapp for development
 
-check-style: golangci-lint plugin-checker vet ## Runs golangci against all packages
+	npm run run &
 
-test-te-race: ## Checks for race conditions in the team edition.
-	@echo Testing TE race conditions
+dev: node_modules ## Runs webpack-dev-server
+	npm run dev-server
 
-	@echo "Packages to test: "$(TE_PACKAGES)
+run-fullmap: node_modules ## Legacy alias to run
+	@echo Running mattermost Webapp for development
 
-	@for package in $(TE_PACKAGES); do \
-		echo "Testing "$$package; \
-		$(GO) test $(GOFLAGS) -race -run=$(TESTS) -test.timeout=4000s $$package || exit 1; \
-	done
+	npm run run &
 
-test-ee-race: check-prereqs-enterprise ## Checks for race conditions in the enterprise edition.
-	@echo Testing EE race conditions
+stop: ## Stops webpack
+	@echo Stopping changes watching
 
-ifeq ($(BUILD_ENTERPRISE_READY),true)
-	@echo "Packages to test: "$(EE_PACKAGES)
-
-	for package in $(EE_PACKAGES); do \
-		echo "Testing "$$package; \
-		$(GO) test $(GOFLAGS) -race -run=$(TESTS) -c $$package; \
-		if [ -f $$(basename $$package).test ]; then \
-			echo "Testing "$$package; \
-			./$$(basename $$package).test -test.timeout=2000s || exit 1; \
-			rm -r $$(basename $$package).test; \
-		fi; \
-	done
-
-	rm -f config/*.crt
-	rm -f config/*.key
-endif
-
-test-server-race: test-te-race test-ee-race ## Checks for race conditions.
-	find . -type d -name data -not -path './vendor/*' | xargs rm -rf
-
-do-cover-file: ## Creates the test coverage report file.
-	@echo "mode: count" > cover.out
-
-go-junit-report:
-	$(GO) get -modfile=go.tools.mod github.com/jstemmer/go-junit-report
-
-test-compile: ## Compile tests.
-	@echo COMPILE TESTS
-
-	for package in $(TE_PACKAGES) $(EE_PACKAGES); do \
-		$(GO) test $(GOFLAGS) -c $$package; \
-	done
-
-test-db-migration: start-docker ## Gets diff of upgrade vs new instance schemas.
-	./scripts/mysql-migration-test.sh
-	./scripts/psql-migration-test.sh
-
-gomodtidy:
-	@cp go.mod go.mod.orig
-	@cp go.sum go.sum.orig
-	$(GO) mod tidy
-	@if [ "$$(diff go.mod go.mod.orig)" != "" -o "$$(diff go.sum go.sum.orig)" != "" ]; then \
-		echo "go.mod/go.sum was modified. \ndiff- $$(diff go.mod go.mod.orig) \n$$(diff go.sum go.sum.orig) \nRun \"go mod tidy\"."; \
-		rm go.*.orig; \
-		exit 1; \
-	fi;
-	@rm go.*.orig;
-
-test-server: check-prereqs-enterprise start-docker-check start-docker go-junit-report do-cover-file ## Runs tests.
-ifeq ($(BUILD_ENTERPRISE_READY),true)
-	@echo Running all tests
+ifeq ($(OS),Windows_NT)
+	wmic process where "Caption='node.exe' and CommandLine like '%webpack%'" call terminate
 else
-	@echo Running only TE tests
-endif
-	./scripts/test.sh "$(GO)" "$(GOFLAGS)" "$(ALL_PACKAGES)" "$(TESTS)" "$(TESTFLAGS)" "$(GOBIN)"
-  ifneq ($(IS_CI),true)
-    ifneq ($(MM_NO_DOCKER),true)
-      ifneq ($(TEMP_DOCKER_SERVICES),)
-	      @echo Stopping temporary docker services
-	      docker-compose stop $(TEMP_DOCKER_SERVICES)
-      endif
-    endif
-  endif
-
-test-server-ee: check-prereqs-enterprise start-docker-check start-docker go-junit-report do-cover-file ## Runs EE tests.
-	@echo Running only EE tests
-	./scripts/test.sh "$(GO)" "$(GOFLAGS)" "$(EE_PACKAGES)" "$(TESTS)" "$(TESTFLAGS)" "$(GOBIN)"
-
-test-server-quick: check-prereqs-enterprise ## Runs only quick tests.
-ifeq ($(BUILD_ENTERPRISE_READY),true)
-	@echo Running all tests
-	$(GO) test $(GOFLAGS) -short $(ALL_PACKAGES)
-else
-	@echo Running only TE tests
-	$(GO) test $(GOFLAGS) -short $(TE_PACKAGES)
+	@for PROCID in $$(ps -ef | grep "[n]ode.*[w]ebpack" | awk '{ print $$2 }'); do \
+		echo stopping webpack watch $$PROCID; \
+		kill $$PROCID; \
+	done
 endif
 
-internal-test-web-client: ## Runs web client tests.
-	$(GO) run $(GOFLAGS) $(PLATFORM_FILES) test web_client_tests
+restart: | stop run ## Restarts the app
 
-run-server-for-web-client-tests: ## Tests the server for web client.
-	$(GO) run $(GOFLAGS) $(PLATFORM_FILES) test web_client_tests_server
+clean: ## Clears cached; deletes node_modules and dist directories
+	@echo Cleaning Webapp
 
-test-client: ## Test client app.
-	@echo Running client tests
+	rm -rf dist
+	rm -rf node_modules
 
-	cd $(BUILD_WEBAPP_DIR) && $(MAKE) test
-
-test: test-server test-client ## Runs all checks and tests below (except race detection and postgres).
-
-cover: ## Runs the golang coverage tool. You must run the unit tests first.
-	@echo Opening coverage info in browser. If this failed run make test first
-
-	$(GO) tool cover -html=cover.out
-	$(GO) tool cover -html=ecover.out
-
-test-data: start-docker ## Add test data to the local instance.
-	$(GO) run $(GOFLAGS) -ldflags '$(LDFLAGS)' $(PLATFORM_FILES) config set TeamSettings.MaxUsersPerTeam 100
-	$(GO) run $(GOFLAGS) -ldflags '$(LDFLAGS)' $(PLATFORM_FILES) sampledata -w 4 -u 60
-
-	@echo You may need to restart the Mattermost server before using the following
-	@echo ========================================================================
-	@echo Login with a system admin account username=sysadmin password=Sys@dmin-sample1
-	@echo Login with a regular account username=user-1 password=SampleUs@r-1
-	@echo ========================================================================
-
-validate-go-version: ## Validates the installed version of go against Mattermost's minimum requirement.
-	@if [ $(GO_MAJOR_VERSION) -gt $(MINIMUM_SUPPORTED_GO_MAJOR_VERSION) ]; then \
-		exit 0 ;\
-	elif [ $(GO_MAJOR_VERSION) -lt $(MINIMUM_SUPPORTED_GO_MAJOR_VERSION) ]; then \
-		echo '$(GO_VERSION_VALIDATION_ERR_MSG)';\
-		exit 1; \
-	elif [ $(GO_MINOR_VERSION) -lt $(MINIMUM_SUPPORTED_GO_MINOR_VERSION) ] ; then \
-		echo '$(GO_VERSION_VALIDATION_ERR_MSG)';\
-		exit 1; \
+e2e-test: node_modules
+	@echo E2E: Running mattermost-mysql-e2e
+	@if [ $(shell docker ps -a | grep -ci mattermost-mysql-e2e) -eq 0 ]; then \
+		echo starting mattermost-mysql-e2e; \
+		docker run --name mattermost-mysql-e2e -p 35476:3306 -e MYSQL_ROOT_PASSWORD=mostest \
+		-e MYSQL_USER=mmuser -e MYSQL_PASSWORD=mostest -e MYSQL_DATABASE=mattermost_test -d mysql:5.7 > /dev/null; \
+	elif [ $(shell docker ps | grep -ci mattermost-mysql-e2e) -eq 0 ]; then \
+		echo restarting mattermost-mysql-e2e; \
+		docker start mattermost-mysql-e2e > /dev/null; \
 	fi
 
-run-server: prepackaged-binaries validate-go-version start-docker ## Starts the server.
-	@echo Running mattermost for development
+	cd $(BUILD_SERVER_DIR) && [[ -f config/config.json ]] && \
+		cp config/config.json config/config-backup.json && make config-reset || \
+		echo "config.json not found" && make config-reset
 
-	mkdir -p $(BUILD_WEBAPP_DIR)/dist/files
-	$(GO) run $(GOFLAGS) -ldflags '$(LDFLAGS)' $(PLATFORM_FILES) --disableconfigwatch 2>&1 | \
-	    $(GO) run $(GOFLAGS) -ldflags '$(LDFLAGS)' $(PLATFORM_FILES) logs --logrus $(RUN_IN_BACKGROUND)
+	@echo E2E: Starting the server
+	cd $(BUILD_SERVER_DIR) && $(MAKE) run
 
-debug-server: start-docker ## Compile and start server using delve.
-	mkdir -p $(BUILD_WEBAPP_DIR)/dist/files
-	$(DELVE) debug $(PLATFORM_FILES) --build-flags="-ldflags '\
-		-X github.com/mattermost/mattermost-server/v5/model.BuildNumber=$(BUILD_NUMBER)\
-		-X \"github.com/mattermost/mattermost-server/v5/model.BuildDate=$(BUILD_DATE)\"\
-		-X github.com/mattermost/mattermost-server/v5/model.BuildHash=$(BUILD_HASH)\
-		-X github.com/mattermost/mattermost-server/v5/model.BuildHashEnterprise=$(BUILD_HASH_ENTERPRISE)\
-		-X github.com/mattermost/mattermost-server/v5/model.BuildEnterpriseReady=$(BUILD_ENTERPRISE_READY)'"
+	@echo E2E: Generating test data
+	cd $(BUILD_SERVER_DIR) && $(MAKE) test-data
 
-debug-server-headless: start-docker ## Debug server from within an IDE like VSCode or IntelliJ.
-	mkdir -p $(BUILD_WEBAPP_DIR)/dist/files
-	$(DELVE) debug --headless --listen=:2345 --api-version=2 --accept-multiclient $(PLATFORM_FILES) --build-flags="-ldflags '\
-		-X github.com/mattermost/mattermost-server/v5/model.BuildNumber=$(BUILD_NUMBER)\
-		-X \"github.com/mattermost/mattermost-server/v5/model.BuildDate=$(BUILD_DATE)\"\
-		-X github.com/mattermost/mattermost-server/v5/model.BuildHash=$(BUILD_HASH)\
-		-X github.com/mattermost/mattermost-server/v5/model.BuildHashEnterprise=$(BUILD_HASH_ENTERPRISE)\
-		-X github.com/mattermost/mattermost-server/v5/model.BuildEnterpriseReady=$(BUILD_ENTERPRISE_READY)'"
+	@echo E2E: Running end-to-end testing
+	cd e2e && npm install && npm run cypress:run
 
-run-cli: start-docker ## Runs CLI.
-	@echo Running mattermost for development
-	@echo Example should be like 'make ARGS="-version" run-cli'
+	@echo E2E: Stoppping the server
+	cd $(BUILD_SERVER_DIR) && $(MAKE) stop
 
-	$(GO) run $(GOFLAGS) -ldflags '$(LDFLAGS)' $(PLATFORM_FILES) ${ARGS}
+	@echo E2E: stopping mattermost-mysql-e2e
+	docker stop mattermost-mysql-e2e > /dev/null
 
-run-client: ## Runs the webapp.
-	@echo Running mattermost client for development
+	cd $(BUILD_SERVER_DIR) && [[ -f config/config-backup.json ]] && \
+		cp config/config-backup.json config/config.json && echo "revert local config.json" || \
+		echo "config-backup.json not found" && sed -i'' -e 's|"DataSource": ".*"|"DataSource": "mmuser:mostest@tcp(dockerhost:3306)/mattermost_test?charset=utf8mb4,utf8\u0026readTimeout=30s\u0026writeTimeout=30s"|g' config/config.json
 
-	ln -nfs $(BUILD_WEBAPP_DIR)/dist client
-	cd $(BUILD_WEBAPP_DIR) && $(MAKE) run
+	@echo E2E: Tests completed
 
-run-client-fullmap: ## Legacy alias to run-client
-	@echo Running mattermost client for development
+clean-e2e:
+	@if [ $(shell docker ps -a | grep -ci mattermost-mysql-e2e) -eq 1 ]; then \
+		echo stopping mattermost-mysql-e2e; \
+		docker stop mattermost-mysql-e2e > /dev/null; \
+	fi
 
-	cd $(BUILD_WEBAPP_DIR) && $(MAKE) run
+	cd $(BUILD_SERVER_DIR) && [[ -f config/config-backup.json ]] && \
+		cp config/config-backup.json config/config.json && echo "revert local config.json" || \
+		echo "config-backup.json not found" && sed -i'' -e 's|"DataSource": ".*"|"DataSource": "mmuser:mostest@tcp(dockerhost:3306)/mattermost_test?charset=utf8mb4,utf8\u0026readTimeout=30s\u0026writeTimeout=30s"|g' config/config.json
 
-run: check-prereqs run-server run-client ## Runs the server and webapp.
-
-run-fullmap: run-server run-client ## Legacy alias to run
-
-stop-server: ## Stops the server.
-	@echo Stopping mattermost
-
-ifeq ($(BUILDER_GOOS_GOARCH),"windows_amd64")
-	wmic process where "Caption='go.exe' and CommandLine like '%go.exe run%'" call terminate
-	wmic process where "Caption='mattermost.exe' and CommandLine like '%go-build%'" call terminate
-else
-	@for PID in $$(ps -ef | grep "[g]o run" | grep "disableconfigwatch" | awk '{ print $$2 }'); do \
-		echo stopping go $$PID; \
-		kill $$PID; \
-	done
-	@for PID in $$(ps -ef | grep "[g]o-build" | grep "disableconfigwatch" | awk '{ print $$2 }'); do \
-		echo stopping mattermost $$PID; \
-		kill $$PID; \
-	done
-endif
-
-stop-client: ## Stops the webapp.
-	@echo Stopping mattermost client
-
-	cd $(BUILD_WEBAPP_DIR) && $(MAKE) stop
-
-stop: stop-server stop-client stop-docker ## Stops server, client and the docker compose.
-
-restart: restart-server restart-client ## Restarts the server and webapp.
-
-restart-server: | stop-server run-server ## Restarts the mattermost server to pick up development change.
-
-restart-haserver:
-	@echo Restarting mattermost in an HA topology
-
-	docker-compose restart follower
-	docker-compose restart leader
-	docker-compose restart haproxy
-
-restart-client: | stop-client run-client ## Restarts the webapp.
-
-run-job-server: ## Runs the background job server.
-	@echo Running job server for development
-	$(GO) run $(GOFLAGS) -ldflags '$(LDFLAGS)' $(PLATFORM_FILES) jobserver --disableconfigwatch &
-
-config-ldap: ## Configures LDAP.
-	@echo Setting up configuration for local LDAP
-
-	@sed -i'' -e 's|"LdapServer": ".*"|"LdapServer": "localhost"|g' config/config.json
-	@sed -i'' -e 's|"BaseDN": ".*"|"BaseDN": "dc=mm,dc=test,dc=com"|g' config/config.json
-	@sed -i'' -e 's|"BindUsername": ".*"|"BindUsername": "cn=admin,dc=mm,dc=test,dc=com"|g' config/config.json
-	@sed -i'' -e 's|"BindPassword": ".*"|"BindPassword": "mostest"|g' config/config.json
-	@sed -i'' -e 's|"FirstNameAttribute": ".*"|"FirstNameAttribute": "cn"|g' config/config.json
-	@sed -i'' -e 's|"LastNameAttribute": ".*"|"LastNameAttribute": "sn"|g' config/config.json
-	@sed -i'' -e 's|"NicknameAttribute": ".*"|"NicknameAttribute": "cn"|g' config/config.json
-	@sed -i'' -e 's|"EmailAttribute": ".*"|"EmailAttribute": "mail"|g' config/config.json
-	@sed -i'' -e 's|"UsernameAttribute": ".*"|"UsernameAttribute": "uid"|g' config/config.json
-	@sed -i'' -e 's|"IdAttribute": ".*"|"IdAttribute": "uid"|g' config/config.json
-	@sed -i'' -e 's|"LoginIdAttribute": ".*"|"LoginIdAttribute": "uid"|g' config/config.json
-	@sed -i'' -e 's|"GroupDisplayNameAttribute": ".*"|"GroupDisplayNameAttribute": "cn"|g' config/config.json
-	@sed -i'' -e 's|"GroupIdAttribute": ".*"|"GroupIdAttribute": "entryUUID"|g' config/config.json
-
-config-reset: ## Resets the config/config.json file to the default.
-	@echo Resetting configuration to default
-	rm -f config/config.json
-	OUTPUT_CONFIG=$(PWD)/config/config.json $(GO) generate $(GOFLAGS) ./config
-
-diff-config: ## Compares default configuration between two mattermost versions
-	@./scripts/diff-config.sh
-
-clean: stop-docker ## Clean up everything except persistant server data.
-	@echo Cleaning
-
-	rm -Rf $(DIST_ROOT)
-	$(GO) clean $(GOFLAGS) -i ./...
-
-	cd $(BUILD_WEBAPP_DIR) && $(MAKE) clean
-
-	find . -type d -name data -not -path './vendor/*' | xargs rm -rf
-	rm -rf logs
-
-	rm -f mattermost.log
-	rm -f mattermost.log.jsonl
-	rm -f npm-debug.log
-	rm -f .prepare-go
-	rm -f enterprise
-	rm -f cover.out
-	rm -f ecover.out
-	rm -f *.out
-	rm -f *.test
-	rm -f imports/imports.go
-	rm -f cmd/platform/cprofile*.out
-	rm -f cmd/mattermost/cprofile*.out
-
-nuke: clean clean-docker ## Clean plus removes persistent server data.
-	@echo BOOM
-
-	rm -rf data
-
-setup-mac: ## Adds macOS hosts entries for Docker.
-	echo $$(boot2docker ip 2> /dev/null) dockerhost | sudo tee -a /etc/hosts
-
-update-dependencies: ## Uses go get -u to update all the dependencies while holding back any that require it.
-	@echo Updating Dependencies
-
-	# Update all dependencies (does not update across major versions)
-	$(GO) get -u ./...
-
-	# Copy everything to vendor directory
-	$(GO) mod vendor
-
-	# Tidy up
-	$(GO) mod tidy
-
-vet: ## Run mattermost go vet specific checks
-	@if ! [ -x "$$(command -v $(GOBIN)/mattermost-govet)" ]; then \
-		echo "mattermost-govet is not installed. Please install it executing \"GO111MODULE=off GOBIN=$(PWD)/bin go get -u github.com/mattermost/mattermost-govet\""; \
-		exit 1; \
-	fi;
-	@VET_CMD="-license -structuredLogging -inconsistentReceiverName -inconsistentReceiverName.ignore=session_serial_gen.go,team_member_serial_gen.go,user_serial_gen.go -emptyStrCmp -tFatal"; \
-	if ! [ -z "${MM_VET_OPENSPEC_PATH}" ] && [ -f "${MM_VET_OPENSPEC_PATH}" ]; then \
-		VET_CMD="$$VET_CMD -openApiSync -openApiSync.spec=$$MM_VET_OPENSPEC_PATH"; \
-	else \
-		echo "MM_VET_OPENSPEC_PATH not set or spec yaml path in it is incorrect. Skipping API check"; \
-	fi; \
-	$(GO) vet -vettool=$(GOBIN)/mattermost-govet $$VET_CMD ./...
-ifeq ($(BUILD_ENTERPRISE_READY),true)
-ifneq ($(MM_NO_ENTERPRISE_LINT),true)
-	$(GO) vet -vettool=$(GOBIN)/mattermost-govet -enterpriseLicense -structuredLogging -tFatal ./enterprise/...
-endif
-endif
-
-gen-serialized: ## Generates serialization methods for hot structs
-	# This tool only works at a file level, not at a package level.
-	# There will be some warnings about "unresolved identifiers",
-	# but that is because of the above problem. Since we are generating
-	# methods for all the relevant files at a package level, all
-	# identifiers will be resolved. An alternative to remove the warnings
-	# would be to temporarily move all the structs to the same file,
-	# but that involves a lot of manual work.
-	$(GO) get -modfile=go.tools.mod github.com/tinylib/msgp
-	$(GOBIN)/msgp -file=./model/session.go -tests=false -o=./model/session_serial_gen.go
-	$(GOBIN)/msgp -file=./model/user.go -tests=false -o=./model/user_serial_gen.go
-	$(GOBIN)/msgp -file=./model/team_member.go -tests=false -o=./model/team_member_serial_gen.go
-
-todo: ## Display TODO and FIXME items in the source code.
-	@! ag --ignore Makefile --ignore-dir vendor --ignore-dir runtime TODO
-	@! ag --ignore Makefile --ignore-dir vendor --ignore-dir runtime XXX
-	@! ag --ignore Makefile --ignore-dir vendor --ignore-dir runtime FIXME
-	@! ag --ignore Makefile --ignore-dir vendor --ignore-dir runtime "FIX ME"
-ifeq ($(BUILD_ENTERPRISE_READY),true)
-	@! ag --ignore Makefile --ignore-dir vendor --ignore-dir runtime TODO enterprise/
-	@! ag --ignore Makefile --ignore-dir vendor --ignore-dir runtime XXX enterprise/
-	@! ag --ignore Makefile --ignore-dir vendor --ignore-dir runtime FIXME enterprise/
-	@! ag --ignore Makefile --ignore-dir vendor --ignore-dir runtime "FIX ME" enterprise/
-endif
+emojis: ## Creates emoji JSON, JSX and Go files and extracts emoji images from the system font
+	gem install bundler
+	bundle install --gemfile=$(EMOJI_TOOLS_DIR)/Gemfile
+	BUNDLE_GEMFILE=$(EMOJI_TOOLS_DIR)/Gemfile SERVER_DIR=$(BUILD_SERVER_DIR) bundle exec $(EMOJI_TOOLS_DIR)/make-emojis
 
 ## Help documentatin à la https://marmelab.com/blog/2016/02/29/auto-documented-makefile.html
 help:
-	@grep -E '^[0-9a-zA-Z_-]+:.*?## .*$$' ./Makefile | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
-	@echo
-	@echo You can modify the default settings for this Makefile creating a file config.mk based on the default-config.mk
-	@echo
+	@grep -E '^[0-9a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
+
+update-dependencies: # Updates the dependencies
+	npm update --depth 9999
+	npm audit fix
+	@echo Automatic dependency update complete.
+	@echo You should manually inspect changes to package.json and pin exact versions of packages where appropriate.
